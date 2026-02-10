@@ -1,4 +1,31 @@
+'use client';
+
+import { useAuth } from '@/contexts/AuthContext';
+
 export default function DashboardPage() {
+  const { user } = useAuth();
+  
+  // 未登录提示
+  if (!user) {
+    return (
+      <div className="flex items-center justify-center min-h-96">
+        <div className="text-center">
+          <h2 className="text-2xl font-semibold text-gray-900 mb-4">请先登录</h2>
+          <p className="text-gray-600 mb-6">登录后即可查看数据仪表板</p>
+          <button
+            onClick={() => {
+              const event = new CustomEvent('openLoginModal');
+              window.dispatchEvent(event);
+            }}
+            className="px-6 py-2 bg-primary text-white rounded-md hover:bg-primary/90"
+          >
+            立即登录
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div className="text-center py-20">

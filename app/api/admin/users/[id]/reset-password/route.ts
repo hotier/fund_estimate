@@ -17,6 +17,9 @@ export async function POST(
     const token = authHeader?.replace('Bearer ', '');
 
     // 验证管理员权限
+    if (!token) {
+      throw new Error('未提供认证令牌');
+    }
     const { userId: adminId } = await validateUserAccess(token, true);
     const targetUserId = params.id;
 

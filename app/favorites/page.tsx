@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface FundData {
   code: string;
@@ -14,6 +15,7 @@ interface FundData {
 }
 
 interface FundWithHoldings extends FundData {
+  id?: string;
   holdings: number;
   units?: number;
   estimatedProfit: number;
@@ -36,12 +38,42 @@ type SortOption = 'code' | 'name' | 'estimate' | 'change' | 'holdings' | 'profit
 
 const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#8884D8', '#82CA9D', '#FFC658', '#FF7C7C'];
 
+// 数据验证工具函数
+const validateFundData = (fund: any): fund is FundData => {
+  return (
+    fund &&
+    fund.code &&
+    fund.name &&
+    fund.estimate_value !== undefined &&
+    fund.change_percent !== undefined &&
+    fund.update_time &&
+    typeof fund.code === 'string' &&
+    typeof fund.name === 'string' &&
+    (typeof fund.estimate_value === 'string' || typeof fund.estimate_value === 'number') &&
+    typeof fund.change_percent === 'number'
+  );
+};
+
+const validateFundWithHoldings = (fund: any): fund is FundWithHoldings => {
+  return (
+    validateFundData(fund) &&
+    fund.holdings !== undefined &&
+    fund.estimatedProfit !== undefined &&
+    typeof fund.holdings === 'number' &&
+    typeof fund.estimatedProfit === 'number' &&
+    Array.isArray(fund.stocks)
+  );
+};
+
 export default function FavoritesPage() {
+  const { user, token, favorites: dbFavorites, groups: dbGroups, refreshFavorites, refreshGroups } = useAuth();
+
   const [funds, setFunds] = useState<FundWithHoldings[]>([]);
   const [loading, setLoading] = useState(true);
   const [sortBy, setSortBy] = useState<SortOption>('name');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
   const [editingHoldings, setEditingHoldings] = useState<string | null>(null);
+  const [lastUpdateTime, setLastUpdateTime] = useState<number>(Date.now());
 
   // 分组相关
   const [groups, setGroups] = useState<Group[]>([]);
@@ -60,54 +92,115 @@ export default function FavoritesPage() {
   const [singleFundSuggestions, setSingleFundSuggestions] = useState<any[]>([]);
   const [batchFundCodes, setBatchFundCodes] = useState('');
 
-  // 从 localStorage 加载分组
+  // 从数据库加载分组
   useEffect(() => {
     loadGroups();
-  }, []);
+  }, [dbGroups]);
 
   const loadGroups = () => {
-    const savedGroups = JSON.parse(localStorage.getItem('fundGroups') || '[]');
-    const savedMapping = JSON.parse(localStorage.getItem('fundGroupMapping') || '[]');
+    // 优先使用数据库中的分组
+    if (dbGroups && dbGroups.length > 0) {
+      const formattedGroups: Group[] = dbGroups.map(g => ({
+        id: g.id,
+        name: g.name,
+        createdAt: new Date(g.created_at).getTime(),
+        isDefault: g.is_default,
+      }));
 
-    if (savedGroups.length === 0) {
-      const defaultGroup: Group = {
-        id: 'all',
-        name: '全部',
-        createdAt: Date.now(),
-        isDefault: true,
-      };
-      setGroups([defaultGroup]);
-      localStorage.setItem('fundGroups', JSON.stringify([defaultGroup]));
+      // 确保始终有"全部"分组
+      const hasAllGroup = formattedGroups.some(g => g.isDefault);
+      if (!hasAllGroup) {
+        const allGroup: Group = {
+          id: 'all',
+          name: '全部',
+          createdAt: Date.now(),
+          isDefault: true,
+        };
+        setGroups([allGroup, ...formattedGroups]);
+      } else {
+        setGroups(formattedGroups);
+      }
     } else {
-      setGroups(savedGroups);
-    }
+      // 降级使用 localStorage
+      const savedGroups = JSON.parse(localStorage.getItem('fundGroups') || '[]');
+      const savedMapping = JSON.parse(localStorage.getItem('fundGroupMapping') || '[]');
 
-    setFundGroupMapping(savedMapping);
+      if (savedGroups.length === 0) {
+        const defaultGroup: Group = {
+          id: 'all',
+          name: '全部',
+          createdAt: Date.now(),
+          isDefault: true,
+        };
+        setGroups([defaultGroup]);
+        localStorage.setItem('fundGroups', JSON.stringify([defaultGroup]));
+      } else {
+        // 确保 localStorage 中也有"全部"分组
+        const hasAllGroup = savedGroups.some((g: Group) => g.isDefault);
+        if (!hasAllGroup) {
+          const allGroup: Group = {
+            id: 'all',
+            name: '全部',
+            createdAt: Date.now(),
+            isDefault: true,
+          };
+          setGroups([allGroup, ...savedGroups]);
+          localStorage.setItem('fundGroups', JSON.stringify([allGroup, ...savedGroups]));
+        } else {
+          setGroups(savedGroups);
+        }
+      }
+      setFundGroupMapping(savedMapping);
+    }
   };
 
   // 创建新分组
-  const createGroup = () => {
+  const createGroup = async () => {
     if (!newGroupName.trim()) {
       alert('请输入分组名称');
       return;
     }
 
-    const newGroup: Group = {
-      id: Date.now().toString(),
-      name: newGroupName.trim(),
-      createdAt: Date.now(),
-      isDefault: false,
-    };
+    if (user && token) {
+      // 保存到数据库
+      try {
+        await (await import('@/lib/services/auth-service')).createGroup(
+          user.id,
+          newGroupName.trim()
+        );
+        await refreshGroups();
+        setNewGroupName('');
+      } catch (error: any) {
+        console.error('创建分组失败:', error);
+        if (error.code === '23505') {
+          alert('该分组名称已存在');
+        } else if (error.code === '409' || error.status === 409) {
+          alert('分组冲突：可能该分组名称已存在');
+        } else {
+          alert(error.message || '创建分组失败');
+        }
+        return;
+      }
+    } else {
+      // 保存到 localStorage
+      const newGroup: Group = {
+        id: Date.now().toString(),
+        name: newGroupName.trim(),
+        createdAt: Date.now(),
+        isDefault: false,
+      };
 
-    const updatedGroups = [...groups, newGroup];
-    setGroups(updatedGroups);
-    localStorage.setItem('fundGroups', JSON.stringify(updatedGroups));
+      const updatedGroups = [...groups, newGroup];
+      setGroups(updatedGroups);
+      localStorage.setItem('fundGroups', JSON.stringify(updatedGroups));
+    }
+
     setNewGroupName('');
     setShowGroupManage(false);
   };
 
   // 删除分组
-  const deleteGroup = (groupId: string) => {
+  const deleteGroup = async (groupId: string) => {
     if (groupId === 'all') {
       alert('默认分组不能删除');
       return;
@@ -117,21 +210,37 @@ export default function FavoritesPage() {
       return;
     }
 
-    const updatedGroups = groups.filter(g => g.id !== groupId);
-    setGroups(updatedGroups);
-    localStorage.setItem('fundGroups', JSON.stringify(updatedGroups));
-
-    const updatedMapping = fundGroupMapping.map(mapping => {
-      if (mapping.groupId === groupId) {
-        return { ...mapping, groupId: 'all' };
+    if (user && token) {
+      // 从数据库删除
+      try {
+        await (await import('@/lib/services/auth-service')).deleteGroup(groupId, user.id);
+        await refreshGroups();
+      } catch (error: any) {
+        alert(error.message || '删除分组失败');
+        return;
       }
-      return mapping;
-    });
-    setFundGroupMapping(updatedMapping);
-    localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
 
-    if (selectedGroupId === groupId) {
-      setSelectedGroupId('all');
+      if (selectedGroupId === groupId) {
+        setSelectedGroupId('all');
+      }
+    } else {
+      // 从 localStorage 删除
+      const updatedGroups = groups.filter(g => g.id !== groupId);
+      setGroups(updatedGroups);
+      localStorage.setItem('fundGroups', JSON.stringify(updatedGroups));
+
+      const updatedMapping = fundGroupMapping.map(mapping => {
+        if (mapping.groupId === groupId) {
+          return { ...mapping, groupId: 'all' };
+        }
+        return mapping;
+      });
+      setFundGroupMapping(updatedMapping);
+      localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+
+      if (selectedGroupId === groupId) {
+        setSelectedGroupId('all');
+      }
     }
   };
 
@@ -151,15 +260,29 @@ export default function FavoritesPage() {
       .map(m => m.fundCode);
   };
 
-  // 从 localStorage 加载自选基金
+  // 从数据库加载自选基金
   useEffect(() => {
     loadFavorites();
-  }, [selectedGroupId, fundGroupMapping]);
+  }, [dbFavorites, selectedGroupId, fundGroupMapping]);
 
-  const loadFavorites = async () => {
+  const loadFavorites = async (useCache: boolean = true) => {
     setLoading(true);
     try {
-      const currentGroupFundCodes = getCurrentGroupFundCodes();
+      let currentGroupFundCodes: string[] = [];
+
+      if (user && token && dbFavorites && dbFavorites.length > 0) {
+        // 从数据库加载
+        if (selectedGroupId === 'all') {
+          currentGroupFundCodes = dbFavorites.map(f => f.fund_code);
+        } else {
+          currentGroupFundCodes = dbFavorites
+            .filter(f => f.group_id === selectedGroupId)
+            .map(f => f.fund_code);
+        }
+      } else {
+        // 从 localStorage 加载
+        currentGroupFundCodes = getCurrentGroupFundCodes();
+      }
 
       if (currentGroupFundCodes.length === 0) {
         setFunds([]);
@@ -167,50 +290,86 @@ export default function FavoritesPage() {
         return;
       }
 
-      const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
-      const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+      // 优先使用缓存数据（如果是首次加载）
+      if (useCache) {
+        const cachedFundsData = localStorage.getItem('favorites_cache');
+        const cachedFundsTime = localStorage.getItem('favorites_cache_time');
+        
+        if (cachedFundsData && cachedFundsTime) {
+          try {
+            const cacheAge = Date.now() - parseInt(cachedFundsTime);
+            const CACHE_DURATION = 5 * 60 * 1000; // 5 分钟缓存
+            
+            // 检查缓存是否过期
+            if (cacheAge > CACHE_DURATION) {
+              console.log(`[自选页] 缓存已过期 (${Math.floor(cacheAge / 1000)}秒)，重新获取数据`);
+              localStorage.removeItem('favorites_cache');
+              localStorage.removeItem('favorites_cache_time');
+            } else {
+              const cachedFunds = JSON.parse(cachedFundsData);
+              
+              // 验证缓存数据的完整性
+              const isValidCache = cachedFunds.every(validateFundWithHoldings);
 
-      const fundPromises = currentGroupFundCodes.map(async (code: string) => {
-        try {
-          const cacheKey = `fund_cache_${code}`;
-          const cachedData = localStorage.getItem(cacheKey);
-          const cacheTime = localStorage.getItem(`${cacheKey}_time`);
-
-          if (cachedData && cacheTime) {
-            const cacheAge = Date.now() - parseInt(cacheTime);
-            if (cacheAge < 24 * 60 * 60 * 1000) {
-              const data = JSON.parse(cachedData);
-              return {
-                ...data,
-                holdings: holdingsMap[code] || 0,
-                estimatedProfit: holdingsMap[code] ? (holdingsMap[code] * data.change_percent / 100) : 0,
-                totalProfit: totalProfitMap[code] || 0,
-              };
+              if (!isValidCache) {
+                console.warn('[自选页] 缓存数据不完整，重新获取');
+                localStorage.removeItem('favorites_cache');
+                localStorage.removeItem('favorites_cache_time');
+              } else {
+                const cachedFundCodes = cachedFunds.map((f: any) => f.code);
+                // 检查缓存的基金代码是否匹配当前分组
+                const currentCodesSet = new Set(currentGroupFundCodes);
+                const cachedCodesSet = new Set(cachedFundCodes);
+                
+                // 如果缓存数据有效（基金代码匹配且数据完整），先显示缓存
+                if (currentCodesSet.size === cachedCodesSet.size && 
+                    currentGroupFundCodes.every(code => cachedCodesSet.has(code))) {
+                  console.log(`[自选页] 使用缓存数据快速加载 (缓存剩余 ${Math.floor((CACHE_DURATION - cacheAge) / 1000)}秒)`);
+                  
+                  // 从数据库获取持仓和收益数据
+                  const fundsWithHoldings = cachedFunds.map((fund: any) => {
+                    let holdings = 0;
+                    let totalProfit = 0;
+                    if (user && token && dbFavorites) {
+                      const dbFund = dbFavorites.find(f => f.fund_code === fund.code);
+                      if (dbFund) {
+                        holdings = dbFund.holdings || 0;
+                        totalProfit = dbFund.total_profit || 0;
+                      }
+                    } else {
+                      const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
+                      const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+                      holdings = holdingsMap[fund.code] || 0;
+                      totalProfit = totalProfitMap[fund.code] || 0;
+                    }
+                    
+                    return {
+                      ...fund,
+                      holdings,
+                      estimatedProfit: holdings ? (holdings * fund.change_percent / 100) : 0,
+                      totalProfit,
+                    };
+                  });
+                  
+                  setFunds(fundsWithHoldings);
+                  setLoading(false); // 先显示缓存
+                  
+                  // 然后在后台静默更新数据
+                  fetchFreshFundData(currentGroupFundCodes);
+                  return;
+                }
+              }
             }
+          } catch (error) {
+            console.error('[自选页] 读取缓存失败:', error);
+            localStorage.removeItem('favorites_cache');
+            localStorage.removeItem('favorites_cache_time');
           }
-
-          const response = await fetch(`/api/fund/${code}`);
-          if (!response.ok) return null;
-          const data = await response.json();
-
-          localStorage.setItem(cacheKey, JSON.stringify(data));
-          localStorage.setItem(`${cacheKey}_time`, Date.now().toString());
-
-          return {
-            ...data,
-            holdings: holdingsMap[code] || 0,
-            estimatedProfit: holdingsMap[code] ? (holdingsMap[code] * data.change_percent / 100) : 0,
-            totalProfit: totalProfitMap[code] || 0,
-          };
-        } catch (error) {
-          console.error(`获取基金 ${code} 数据失败:`, error);
-          return null;
         }
-      });
+      }
 
-      const results = await Promise.all(fundPromises);
-      const validFunds = results.filter(f => f !== null) as FundWithHoldings[];
-      setFunds(validFunds);
+      // 如果没有缓存或缓存无效，直接获取新数据
+      await fetchFreshFundData(currentGroupFundCodes);
     } catch (error) {
       console.error('加载自选基金失败:', error);
     } finally {
@@ -218,21 +377,202 @@ export default function FavoritesPage() {
     }
   };
 
+  // 获取最新的基金数据
+  const fetchFreshFundData = async (fundCodes: string[]) => {
+    console.log(`[自选页] 从 API 获取 ${fundCodes.length} 只基金的实时数据...`);
+    
+    const fundPromises = fundCodes.map(async (code: string) => {
+      try {
+        // 直接从 API 获取实时估值数据（不使用缓存）
+        console.log(`[自选页] 从 API 获取基金 ${code} 的实时估值数据...`);
+        const response = await fetch(`/api/fund/${code}`);
+        if (!response.ok) {
+          console.error(`[自选页] 获取基金 ${code} 数据失败:`, response.status);
+          return null;
+        }
+        const fundData = await response.json();
+
+        // 从数据库获取持仓和收益数据
+        let holdings = 0;
+        let totalProfit = 0;
+        if (user && token && dbFavorites) {
+          const dbFund = dbFavorites.find(f => f.fund_code === code);
+          if (dbFund) {
+            holdings = dbFund.holdings || 0;
+            totalProfit = dbFund.total_profit || 0;
+          }
+        } else {
+          // 从 localStorage 获取
+          const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
+          const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+          holdings = holdingsMap[code] || 0;
+          totalProfit = totalProfitMap[code] || 0;
+        }
+
+        console.log(`[自选页] 基金 ${code} 数据获取成功: ${fundData.name}, 估值: ${fundData.estimate_value}, 涨跌幅: ${fundData.change_percent}%`);
+
+        return {
+          ...fundData,
+          holdings,
+          estimatedProfit: holdings ? (holdings * fundData.change_percent / 100) : 0,
+          totalProfit,
+        };
+      } catch (error) {
+        console.error(`获取基金 ${code} 数据失败:`, error);
+        return null;
+      }
+    });
+
+    const results = await Promise.all(fundPromises);
+    const validFunds = results.filter(f => f !== null) as FundWithHoldings[];
+    
+    // 智能更新：只更新变动的数据
+    setFunds(prevFunds => {
+      if (prevFunds.length === 0) {
+        // 如果没有旧数据，直接使用新数据
+        return validFunds;
+      }
+      
+      // 如果有旧数据，只更新估值相关的字段
+      return validFunds.map(newFund => {
+        const oldFund = prevFunds.find(f => f.code === newFund.code);
+        if (oldFund) {
+          // 检查是否有变化
+          const valueChanged = newFund.estimate_value !== oldFund.estimate_value;
+          const percentChanged = newFund.change_percent !== oldFund.change_percent;
+          
+          if (valueChanged || percentChanged) {
+            console.log(`[自选页] 基金 ${newFund.code} 数据已更新: ${newFund.estimate_value} (${newFund.change_percent}%)`);
+          }
+          
+          return newFund;
+        }
+        return newFund;
+      });
+    });
+    
+    // 验证数据完整性后再保存到缓存
+    console.log(`[自选页] 开始验证 ${validFunds.length} 只基金数据的完整性...`);
+    
+    const isDataValid = validFunds.every((fund, index) => {
+      console.log(`[自选页] 验证基金 ${fund?.code || 'unknown'} (索引 ${index}):`, {
+        stocks: fund?.stocks,
+        stocksType: typeof fund?.stocks,
+        stocksIsArray: Array.isArray(fund?.stocks),
+        stocksLength: Array.isArray(fund?.stocks) ? fund.stocks.length : 'N/A',
+        validateFundDataResult: validateFundData(fund),
+        validateFundWithHoldingsResult: validateFundWithHoldings(fund)
+      });
+      
+      const isValid = validateFundWithHoldings(fund);
+      if (!isValid) {
+        console.error(`[自选页] 基金 ${fund?.code || 'unknown'} (索引 ${index}) 数据验证失败:`, {
+          fund: fund,
+          hasFund: !!fund,
+          hasCode: !!fund?.code,
+          code: fund?.code,
+          codeType: typeof fund?.code,
+          hasName: !!fund?.name,
+          name: fund?.name,
+          nameType: typeof fund?.name,
+          hasEstimateValue: fund?.estimate_value !== undefined,
+          estimateValue: fund?.estimate_value,
+          estimateValueType: typeof fund?.estimate_value,
+          hasChangePercent: fund?.change_percent !== undefined,
+          changePercent: fund?.change_percent,
+          changePercentType: typeof fund?.change_percent,
+          hasUpdateTime: !!fund?.update_time,
+          updateTime: fund?.update_time,
+          hasHoldings: fund?.holdings !== undefined,
+          holdings: fund?.holdings,
+          holdingsType: typeof fund?.holdings,
+          hasEstimatedProfit: fund?.estimatedProfit !== undefined,
+          estimatedProfit: fund?.estimatedProfit,
+          estimatedProfitType: typeof fund?.estimatedProfit,
+          hasStocks: Array.isArray(fund?.stocks),
+          stocks: fund?.stocks,
+          stocksType: typeof fund?.stocks,
+          stocksLength: Array.isArray(fund?.stocks) ? fund.stocks.length : 'N/A'
+        });
+      }
+      return isValid;
+    });
+
+    console.log(`[自选页] 数据验证结果: ${isDataValid ? '通过' : '失败'}`);
+
+    if (isDataValid) {
+      // 保存到缓存（5分钟）
+      localStorage.setItem('favorites_cache', JSON.stringify(validFunds));
+      localStorage.setItem('favorites_cache_time', Date.now().toString());
+      console.log(`[自选页] 已保存 ${validFunds.length} 只基金数据到缓存 (5分钟有效期)`);
+    } else {
+      console.warn('[自选页] 数据验证失败，不保存到缓存');
+      localStorage.removeItem('favorites_cache');
+      localStorage.removeItem('favorites_cache_time');
+    }
+    
+    setLastUpdateTime(Date.now()); // 更新最后更新时间
+    setLoading(false);
+  };
+
+  // 3 分钟自动刷新机制（后台静默更新，不显示 loading）
+  useEffect(() => {
+    const interval = setInterval(() => {
+      console.log('[自选页] 3 分钟自动刷新基金数据（后台静默更新）...');
+      loadFavorites(false); // false 表示不使用缓存，强制获取最新数据
+    }, 3 * 60 * 1000); // 3 分钟 = 180,000 毫秒
+
+    return () => clearInterval(interval);
+  }, [dbFavorites, selectedGroupId]);
+
   // 更新持仓金额
-  const updateHoldings = (code: string, value: string) => {
-    const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
+  const updateHoldings = async (code: string, value: string) => {
     const amount = parseFloat(value) || 0;
 
-    holdingsMap[code] = amount;
-    localStorage.setItem('fundHoldings', JSON.stringify(holdingsMap));
+    // 检查用户是否登录
+    if (!user || !token) {
+      alert('请先登录');
+      return;
+    }
 
+    // 同步到数据库
+    const dbFund = dbFavorites?.find(f => f.fund_code === code);
+    if (!dbFund || !dbFund.id) {
+      console.error('未找到自选基金:', code);
+      alert('未找到该自选基金');
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/favorites/${dbFund.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ holdings: amount }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || '更新失败');
+      }
+
+      // 只刷新数据库数据，不触发基金估值数据刷新
+      await refreshFavorites();
+    } catch (error: any) {
+      console.error('更新持仓失败:', error);
+      alert(error.message || '更新持仓失败');
+      return;
+    }
+
+    // 只更新本地状态，不触发基金估值数据刷新
     setFunds(funds.map(fund => {
       if (fund.code === code) {
-        const newHoldings = amount;
         return {
           ...fund,
-          holdings: newHoldings,
-          estimatedProfit: newHoldings * fund.change_percent / 100,
+          holdings: amount,
+          estimatedProfit: amount * fund.change_percent / 100,
         };
       }
       return fund;
@@ -242,13 +582,47 @@ export default function FavoritesPage() {
   };
 
   // 更新总收益
-  const updateTotalProfit = (code: string, value: string) => {
-    const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+  const updateTotalProfit = async (code: string, value: string) => {
     const amount = parseFloat(value) || 0;
 
-    totalProfitMap[code] = amount;
-    localStorage.setItem('fundTotalProfit', JSON.stringify(totalProfitMap));
+    // 检查用户是否登录
+    if (!user || !token) {
+      alert('请先登录');
+      return;
+    }
 
+    // 同步到数据库
+    const dbFund = dbFavorites?.find(f => f.fund_code === code);
+    if (!dbFund || !dbFund.id) {
+      console.error('未找到自选基金:', code);
+      alert('未找到该自选基金');
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/favorites/${dbFund.id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ totalProfit: amount }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || '更新失败');
+      }
+
+      // 只刷新数据库数据，不触发基金估值数据刷新
+      await refreshFavorites();
+    } catch (error: any) {
+      console.error('更新总收益失败:', error);
+      alert(error.message || '更新总收益失败');
+      return;
+    }
+
+    // 只更新本地状态，不触发基金估值数据刷新
     setFunds(funds.map(fund => {
       if (fund.code === code) {
         return { ...fund, totalProfit: amount };
@@ -258,26 +632,56 @@ export default function FavoritesPage() {
   };
 
   // 移除自选基金
-  const removeFavorite = (code: string) => {
+  const removeFavorite = async (code: string) => {
     if (!confirm('确定要移除这只基金吗？')) return;
 
-    const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
-    const updatedFavorites = favorites.filter((c: string) => c !== code);
-    localStorage.setItem('fundFavorites', JSON.stringify(updatedFavorites));
+    try {
+      if (user && token) {
+        // 从数据库删除
+        const dbFund = dbFavorites?.find(f => f.fund_code === code);
+        if (dbFund && dbFund.id) {
+          const response = await fetch(`/api/favorites/${dbFund.id}`, {
+            method: 'DELETE',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+            },
+          });
 
-    const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
-    delete holdingsMap[code];
-    localStorage.setItem('fundHoldings', JSON.stringify(holdingsMap));
+          if (!response.ok) {
+            throw new Error('删除失败');
+          }
 
-    const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
-    delete totalProfitMap[code];
-    localStorage.setItem('fundTotalProfit', JSON.stringify(totalProfitMap));
+          // 只刷新数据库数据，不触发基金估值数据刷新
+          await refreshFavorites();
+        }
+      } else {
+        // 从 localStorage 删除
+        const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
+        const updatedFavorites = favorites.filter((c: string) => c !== code);
+        localStorage.setItem('fundFavorites', JSON.stringify(updatedFavorites));
 
-    const updatedMapping = fundGroupMapping.filter(m => m.fundCode !== code);
-    setFundGroupMapping(updatedMapping);
-    localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+        const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
+        delete holdingsMap[code];
+        localStorage.setItem('fundHoldings', JSON.stringify(holdingsMap));
 
-    setFunds(funds.filter(f => f.code !== code));
+        const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+        delete totalProfitMap[code];
+        localStorage.setItem('fundTotalProfit', JSON.stringify(totalProfitMap));
+
+        const updatedMapping = fundGroupMapping.filter(m => m.fundCode !== code);
+        setFundGroupMapping(updatedMapping);
+        localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+
+        // 刷新列表
+        await loadFavorites();
+      }
+
+      // 只从本地状态移除，不触发基金估值数据刷新
+      setFunds(funds.filter(f => f.code !== code));
+    } catch (error) {
+      console.error('移除基金失败:', error);
+      alert('移除基金失败');
+    }
   };
 
   // 单个添加自选基金
@@ -294,10 +698,18 @@ export default function FavoritesPage() {
 
     try {
       // 检查是否已存在
-      const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
-      if (favorites.includes(singleFundCode.trim())) {
-        alert('该基金已在自选列表中');
-        return;
+      if (user && token) {
+        const existingFund = dbFavorites?.find(f => f.fund_code === singleFundCode.trim());
+        if (existingFund) {
+          alert('该基金已在自选列表中');
+          return;
+        }
+      } else {
+        const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
+        if (favorites.includes(singleFundCode.trim())) {
+          alert('该基金已在自选列表中');
+          return;
+        }
       }
 
       // 获取基金数据
@@ -309,34 +721,60 @@ export default function FavoritesPage() {
 
       const data = await response.json();
 
-      // 添加到自选列表
-      favorites.push(singleFundCode.trim());
-      localStorage.setItem('fundFavorites', JSON.stringify(favorites));
+      if (user && token) {
+        // 保存到数据库
+        const addResponse = await fetch('/api/favorites', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            fundCode: singleFundCode.trim(),
+            holdings: singleFundHoldings ? parseFloat(singleFundHoldings) : 0,
+            totalProfit: singleFundTotalProfit ? parseFloat(singleFundTotalProfit) : 0,
+            groupId: selectedGroupId !== 'all' ? selectedGroupId : undefined,
+          }),
+        });
 
-      // 添加到分组映射
-      const updatedMapping = [...fundGroupMapping, {
-        fundCode: singleFundCode.trim(),
-        groupId: selectedGroupId,
-      }];
-      setFundGroupMapping(updatedMapping);
-      localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+        if (!addResponse.ok) {
+          const errorData = await addResponse.json();
+          throw new Error(errorData.error || '添加失败');
+        }
 
-      // 保存持仓金额
-      if (singleFundHoldings) {
-        const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
-        holdingsMap[singleFundCode.trim()] = parseFloat(singleFundHoldings);
-        localStorage.setItem('fundHoldings', JSON.stringify(holdingsMap));
+        // 只刷新数据库数据，不触发基金估值数据刷新
+        await refreshFavorites();
+      } else {
+        // 保存到 localStorage
+        const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
+        favorites.push(singleFundCode.trim());
+        localStorage.setItem('fundFavorites', JSON.stringify(favorites));
+
+        // 添加到分组映射
+        const updatedMapping = [...fundGroupMapping, {
+          fundCode: singleFundCode.trim(),
+          groupId: selectedGroupId,
+        }];
+        setFundGroupMapping(updatedMapping);
+        localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+
+        // 保存持仓金额
+        if (singleFundHoldings) {
+          const holdingsMap = JSON.parse(localStorage.getItem('fundHoldings') || '{}');
+          holdingsMap[singleFundCode.trim()] = parseFloat(singleFundHoldings);
+          localStorage.setItem('fundHoldings', JSON.stringify(holdingsMap));
+        }
+
+        // 保存总收益
+        if (singleFundTotalProfit) {
+          const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
+          totalProfitMap[singleFundCode.trim()] = parseFloat(singleFundTotalProfit);
+          localStorage.setItem('fundTotalProfit', JSON.stringify(totalProfitMap));
+        }
+
+        // 刷新列表
+        await loadFavorites();
       }
-
-      // 保存总收益
-      if (singleFundTotalProfit) {
-        const totalProfitMap = JSON.parse(localStorage.getItem('fundTotalProfit') || '{}');
-        totalProfitMap[singleFundCode.trim()] = parseFloat(singleFundTotalProfit);
-        localStorage.setItem('fundTotalProfit', JSON.stringify(totalProfitMap));
-      }
-
-      // 刷新列表
-      await loadFavorites();
 
       // 关闭弹窗并清空表单
       setShowAddFundModal(false);
@@ -347,9 +785,9 @@ export default function FavoritesPage() {
       setSingleFundSuggestions([]);
 
       alert(`已添加 ${data.name} 到自选`);
-    } catch (error) {
+    } catch (error: any) {
       console.error('添加基金失败:', error);
-      alert('添加基金失败');
+      alert(error.message || '添加基金失败');
     }
   };
 
@@ -371,14 +809,23 @@ export default function FavoritesPage() {
     }
 
     try {
-      const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
       const validCodes: string[] = [];
       const errors: string[] = [];
 
       for (const code of codes) {
-        if (favorites.includes(code)) {
-          errors.push(`${code} 已在自选列表中`);
-          continue;
+        // 检查是否已存在
+        if (user && token) {
+          const existingFund = dbFavorites?.find(f => f.fund_code === code);
+          if (existingFund) {
+            errors.push(`${code} 已在自选列表中`);
+            continue;
+          }
+        } else {
+          const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
+          if (favorites.includes(code)) {
+            errors.push(`${code} 已在自选列表中`);
+            continue;
+          }
         }
 
         try {
@@ -388,8 +835,32 @@ export default function FavoritesPage() {
             continue;
           }
 
-          validCodes.push(code);
-          favorites.push(code);
+          if (user && token) {
+            // 保存到数据库
+            const addResponse = await fetch('/api/favorites', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                fundCode: code,
+                holdings: 0,
+                totalProfit: 0,
+                groupId: selectedGroupId !== 'all' ? selectedGroupId : undefined,
+              }),
+            });
+
+            if (!addResponse.ok) {
+              errors.push(`${code} 添加失败`);
+              continue;
+            }
+
+            validCodes.push(code);
+          } else {
+            // 保存到 localStorage
+            validCodes.push(code);
+          }
         } catch (error) {
           errors.push(`${code} 添加失败`);
         }
@@ -400,15 +871,25 @@ export default function FavoritesPage() {
         return;
       }
 
-      localStorage.setItem('fundFavorites', JSON.stringify(favorites));
+      if (!user || !token) {
+        // 保存到 localStorage
+        const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
+        validCodes.forEach(code => {
+          favorites.push(code);
+        });
+        localStorage.setItem('fundFavorites', JSON.stringify(favorites));
 
-      const newMappings = validCodes.map(code => ({
-        fundCode: code,
-        groupId: selectedGroupId,
-      }));
-      const updatedMapping = [...fundGroupMapping, ...newMappings];
-      setFundGroupMapping(updatedMapping);
-      localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+        const newMappings = validCodes.map(code => ({
+          fundCode: code,
+          groupId: selectedGroupId,
+        }));
+        const updatedMapping = [...fundGroupMapping, ...newMappings];
+        setFundGroupMapping(updatedMapping);
+        localStorage.setItem('fundGroupMapping', JSON.stringify(updatedMapping));
+      } else {
+        // 刷新数据库数据
+        await refreshFavorites();
+      }
 
       await loadFavorites();
 
@@ -510,10 +991,70 @@ export default function FavoritesPage() {
     }))
     .sort((a, b) => b.value - a.value);
 
+  // 未登录提示
+  if (!user) {
+    return (
+      <div className="flex items-center justify-center min-h-96">
+        <div className="text-center">
+          <h2 className="text-2xl font-semibold text-gray-900 mb-4">请先登录</h2>
+          <p className="text-gray-600 mb-6">登录后即可查看和管理您的自选基金</p>
+          <button
+            onClick={() => {
+              const event = new CustomEvent('openLoginModal');
+              window.dispatchEvent(event);
+            }}
+            className="px-6 py-2 bg-primary text-white rounded-md hover:bg-primary/90"
+          >
+            立即登录
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-64">
-        <div className="text-gray-600">加载中...</div>
+      <div className="space-y-6">
+        <div className="flex justify-between items-center">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900 mb-2">自选基金</h1>
+            <div className="h-6 bg-gray-200 rounded w-32 animate-pulse"></div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="h-10 bg-gray-200 rounded w-24 animate-pulse"></div>
+            <div className="h-10 bg-gray-200 rounded w-24 animate-pulse"></div>
+          </div>
+        </div>
+
+        {/* 统计卡片骨架 */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          {[1, 2, 3, 4].map((i) => (
+            <div key={i} className="bg-white rounded-lg shadow-sm p-6">
+              <div className="h-4 bg-gray-200 rounded w-20 mb-2 animate-pulse"></div>
+              <div className="h-8 bg-gray-200 rounded w-24 animate-pulse"></div>
+            </div>
+          ))}
+        </div>
+
+        {/* 基金列表骨架 */}
+        <div className="bg-white rounded-lg shadow-sm overflow-hidden">
+          <div className="divide-y divide-gray-200">
+            {[1, 2, 3, 4, 5].map((i) => (
+              <div key={i} className="p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex-1">
+                    <div className="h-5 bg-gray-200 rounded w-48 mb-2 animate-pulse"></div>
+                    <div className="h-4 bg-gray-200 rounded w-24 animate-pulse"></div>
+                  </div>
+                  <div className="flex gap-4">
+                    <div className="h-6 bg-gray-200 rounded w-20 animate-pulse"></div>
+                    <div className="h-6 bg-gray-200 rounded w-20 animate-pulse"></div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
     );
   }
@@ -540,6 +1081,9 @@ export default function FavoritesPage() {
           >
             刷新数据
           </button>
+          <span className="text-sm text-gray-500">
+            更新于 {new Date(lastUpdateTime).toLocaleTimeString('zh-CN')}
+          </span>
         </div>
       </div>
 
@@ -758,11 +1302,11 @@ export default function FavoritesPage() {
                       {fund.name}
                     </Link>
                   </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-gray-900">
+                  <td className="px-4 py-3 whitespace-nowrap text-gray-900 value-update">
                     {fund.estimate_value}
                   </td>
-                  <td className={`px-4 py-3 whitespace-nowrap ${fund.change_percent >= 0 ? 'fund-up' : 'fund-down'}`}>
-                    {fund.change_percent >= 0 ? '+' : ''}{fund.change_percent.toFixed(2)}%
+                  <td className={`px-4 py-3 whitespace-nowrap value-update ${fund.change_percent >= 0 ? 'fund-up' : 'fund-down'}`}>
+                    {fund.change_percent >= 0 ? '+' : ''}{Number(fund.change_percent).toFixed(2)}%
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     {editingHoldings === fund.code ? (

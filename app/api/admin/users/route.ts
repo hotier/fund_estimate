@@ -18,6 +18,9 @@ export async function GET(request: NextRequest) {
     const token = authHeader?.replace('Bearer ', '');
 
     // 验证管理员权限
+    if (!token) {
+      throw new Error('未提供认证令牌');
+    }
     const { role } = await validateUserAccess(token, true);
 
     // 获取所有用户
@@ -46,6 +49,9 @@ export async function POST(request: NextRequest) {
     const token = authHeader?.replace('Bearer ', '');
 
     // 验证管理员权限
+    if (!token) {
+      throw new Error('未提供认证令牌');
+    }
     const { userId: adminId } = await validateUserAccess(token, true);
 
     const body = await request.json();

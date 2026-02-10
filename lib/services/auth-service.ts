@@ -3,9 +3,17 @@
  * 不使用 Supabase Auth，使用自己的用户表和 JWT
  */
 
-import { supabase } from './client';
-import bcrypt from 'bcryptjs';
+import { supabase } from '../supabase/client';
 import jwt from 'jsonwebtoken';
+
+// 动态导入 bcryptjs 以避免客户端加载问题
+let bcrypt: any;
+const getBcrypt = async () => {
+  if (!bcrypt) {
+    bcrypt = (await import('bcryptjs')).default;
+  }
+  return bcrypt;
+};
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const JWT_EXPIRES_IN = '7d'; // token 有效期 7 天
@@ -72,7 +80,8 @@ export async function registerUser(email: string, password: string, displayName?
   }
 
   // 加密密码
-  const passwordHash = await bcrypt.hash(password, 10);
+  const bcryptModule = await getBcrypt();
+  const passwordHash = await bcryptModule.hash(password, 10);
 
   // 创建用户
   const { data, error } = await supabase
@@ -125,7 +134,8 @@ export async function loginUser(email: string, password: string) {
   }
 
   // 验证密码
-  const isPasswordValid = await bcrypt.compare(password, user.password_hash);
+  const bcryptModule = await getBcrypt();
+  const isPasswordValid = await bcryptModule.compare(password, user.password_hash);
   if (!isPasswordValid) {
     throw new Error('邮箱或密码错误');
   }
@@ -216,7 +226,7 @@ export async function validateUserAccess(
 export async function getUserById(userId: string) {
   const { data, error } = await supabase
     .from('users')
-    .select('id, email, display_name, avatar_url, role, is_active, created_at, updated_at')
+    .select('id, email, display_name, avatar_url, role, is_active, last_login_at, created_at, updated_at')
     .eq('id', userId)
     .single();
 
@@ -265,7 +275,8 @@ export async function createUser(
   }
 
   // 加密密码
-  const passwordHash = await bcrypt.hash(password, 10);
+  const bcryptModule = await getBcrypt();
+  const passwordHash = await bcryptModule.hash(password, 10);
 
   // 创建用户
   const { data, error } = await supabase
@@ -330,7 +341,8 @@ export async function updateUser(
  */
 export async function resetUserPassword(targetUserId: string, newPassword: string) {
   // 加密新密码
-  const passwordHash = await bcrypt.hash(newPassword, 10);
+  const bcryptModule = await getBcrypt();
+  const passwordHash = await bcryptModule.hash(newPassword, 10);
 
   const { data, error } = await supabase
     .from('users')
@@ -371,23 +383,46 @@ export async function deleteUser(targetUserId: string) {
  * 获取用户所有分组
  */
 export async function getUserGroups(userId: string) {
-  const { data, error } = await supabase
-    .from('user_groups')
-    .select('*')
-    .eq('user_id', userId)
-    .order('sort_order', { ascending: true });
+  const maxRetries = 3;
+  let lastError: any = null;
 
-  if (error) {
-    throw error;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const { data, error } = await supabase
+        .from('user_groups')
+        .select('*')
+        .eq('user_id', userId)
+        .order('sort_order', { ascending: true });
+
+      if (error) {
+        lastError = error;
+        if (attempt < maxRetries) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+        throw error;
+      }
+
+      return data || [];
+    } catch (error: any) {
+      lastError = error;
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      throw error;
+    }
   }
 
-  return data || [];
+  throw lastError || new Error('获取用户分组失败');
 }
 
 /**
  * 创建分组
  */
 export async function createGroup(userId: string, name: string, isDefault: boolean = false) {
+  console.log(`[createGroup] 开始创建分组 - userId: ${userId}, name: ${name}, isDefault: ${isDefault}`);
+
   const { data, error } = await supabase
     .from('user_groups')
     .insert({
@@ -400,9 +435,16 @@ export async function createGroup(userId: string, name: string, isDefault: boole
     .single();
 
   if (error) {
+    console.error('[createGroup] 创建分组失败:', {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint
+    });
     throw error;
   }
 
+  console.log('[createGroup] 创建分组成功:', data);
   return data;
 }
 
@@ -433,7 +475,25 @@ export async function updateGroup(groupId: string, updates: {
 /**
  * 删除分组
  */
-export async function deleteGroup(groupId: string) {
+export async function deleteGroup(groupId: string, userId: string) {
+  // 检查是否为默认分组
+  const { data: group } = await supabase
+    .from('user_groups')
+    .select('is_default')
+    .eq('id', groupId)
+    .single();
+
+  if (group && group.is_default) {
+    throw new Error('默认分组不能删除');
+  }
+
+  // 将该分组下的基金移到"全部"分组（即 group_id 设为 null）
+  await supabase
+    .from('user_favorites')
+    .update({ group_id: null, updated_at: new Date().toISOString() })
+    .eq('group_id', groupId);
+
+  // 删除分组
   const { error } = await supabase
     .from('user_groups')
     .delete()
@@ -470,22 +530,44 @@ export async function getDefaultGroup(userId: string) {
  * 获取用户自选基金（包含敏感数据）
  */
 export async function getUserFavorites(userId: string, groupId?: string) {
-  let query = supabase
-    .from('user_favorites_view')
-    .select('*')
-    .eq('user_id', userId);
+  const maxRetries = 3;
+  let lastError: any = null;
 
-  if (groupId) {
-    query = query.eq('group_id', groupId);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      let query = supabase
+        .from('user_favorites_view')
+        .select('*')
+        .eq('user_id', userId);
+
+      if (groupId) {
+        query = query.eq('group_id', groupId);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        lastError = error;
+        if (attempt < maxRetries) {
+          // 等待一段时间后重试
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          continue;
+        }
+        throw error;
+      }
+
+      return data || [];
+    } catch (error: any) {
+      lastError = error;
+      if (attempt < maxRetries) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      throw error;
+    }
   }
 
-  const { data, error } = await query;
-
-  if (error) {
-    throw error;
-  }
-
-  return data || [];
+  throw lastError || new Error('获取自选基金失败');
 }
 
 /**
@@ -610,6 +692,7 @@ export async function moveFundToGroup(
     throw error;
   }
 }
+
 
 // ===========================================
 // 统计相关函数

@@ -13,7 +13,10 @@ export async function POST(request: NextRequest) {
 
     // 验证输入
     if (!email || !password) {
-      throw new Error('邮箱和密码不能为空');
+      return NextResponse.json(
+        { success: false, error: '邮箱和密码不能为空' },
+        { status: 400 }
+      );
     }
 
     // 登录用户
@@ -27,7 +30,7 @@ export async function POST(request: NextRequest) {
   } catch (error: any) {
     console.error('登录失败:', error);
     return NextResponse.json(
-      { success: false, error: error.message },
+      { success: false, error: error.message || '登录失败，请重试' },
       { status: 401 }
     );
   }

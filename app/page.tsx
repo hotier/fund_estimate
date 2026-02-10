@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface FundSuggestion {
   code: string;
@@ -16,8 +17,10 @@ export default function Home() {
   const [suggestions, setSuggestions] = useState<FundSuggestion[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [addingFavorite, setAddingFavorite] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
+  const { user, token, refreshFavorites } = useAuth();
 
   // 搜索建议
   useEffect(() => {
@@ -85,6 +88,45 @@ export default function Home() {
     searchFund(suggestion.code);
   };
 
+  // 添加自选基金
+  const handleAddFavorite = async () => {
+    if (!user || !token) {
+      alert('请先登录');
+      return;
+    }
+
+    if (!fundData) {
+      return;
+    }
+
+    setAddingFavorite(true);
+    try {
+      const response = await fetch('/api/favorites', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ fundCode: fundData.code }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        alert(data.error || '添加失败');
+        return;
+      }
+
+      alert('已添加到自选基金');
+      // 刷新自选基金列表
+      refreshFavorites();
+    } catch (error) {
+      alert('添加失败，请重试');
+    } finally {
+      setAddingFavorite(false);
+    }
+  };
+
   // 搜索基金
   const searchFund = async (code?: string) => {
     let targetCode = code || fundCode;
@@ -108,32 +150,16 @@ export default function Home() {
     setShowSuggestions(false);
 
     try {
-      // 先检查本地缓存
-      const cacheKey = `fund_cache_${targetCode}`;
-      const cachedData = localStorage.getItem(cacheKey);
-      const cacheTime = localStorage.getItem(`${cacheKey}_time`);
-
-      // 如果缓存存在且未过期（24小时）
-      if (cachedData && cacheTime) {
-        const cacheAge = Date.now() - parseInt(cacheTime);
-        if (cacheAge < 24 * 60 * 60 * 1000) {
-          console.log('[首页] 使用本地缓存');
-          setFundData(JSON.parse(cachedData));
-          return;
-        }
-      }
-
-      // 从API获取数据
+      // 直接从API获取实时数据（不使用本地缓存）
+      console.log(`[首页] 从 API 获取基金 ${targetCode} 的实时数据...`);
       const response = await fetch(`/api/fund/${targetCode}`);
       if (!response.ok) {
-        throw new Error('获取基金数据失败');
+        const errorData = await response.json();
+        throw new Error(errorData.error || '获取基金数据失败');
       }
       const data = await response.json();
 
-      // 保存到本地缓存（24小时）
-      localStorage.setItem(cacheKey, JSON.stringify(data));
-      localStorage.setItem(`${cacheKey}_time`, Date.now().toString());
-
+      console.log(`[首页] 基金 ${targetCode} 数据获取成功:`, data.name);
       setFundData(data);
     } catch (err) {
       if (err instanceof Error && err.message.includes('未在基金索引中找到')) {
@@ -299,19 +325,11 @@ export default function Home() {
               </div>
               <div className="flex items-center space-x-2">
                 <button
-                  onClick={() => {
-                    const favorites = JSON.parse(localStorage.getItem('fundFavorites') || '[]');
-                    if (!favorites.includes(fundData.code)) {
-                      favorites.push(fundData.code);
-                      localStorage.setItem('fundFavorites', JSON.stringify(favorites));
-                      alert('已添加到自选基金');
-                    } else {
-                      alert('该基金已在自选列表中');
-                    }
-                  }}
-                  className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm hover:bg-green-200"
+                  onClick={handleAddFavorite}
+                  disabled={addingFavorite || !user}
+                  className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm hover:bg-green-200 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  添加自选
+                  {addingFavorite ? '添加中...' : '添加自选'}
                 </button>
                 <span className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm">实时估值</span>
               </div>

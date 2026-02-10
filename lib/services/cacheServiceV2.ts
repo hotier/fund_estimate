@@ -1,5 +1,6 @@
 import { CACHE_TTL } from '../supabase/client';
 import * as database from '../supabase/database';
+import redisCache from './redisCache';
 
 // 缓存项接口
 interface CacheItem<T> {
@@ -45,7 +46,8 @@ class MemoryCache {
   cleanup(): void {
     const now = Date.now();
     let cleaned = 0;
-    for (const [key, item] of this.cache.entries()) {
+    const entries = Array.from(this.cache.entries());
+    for (const [key, item] of entries) {
       if (now > item.expiry) {
         this.cache.delete(key);
         cleaned++;
@@ -55,9 +57,19 @@ class MemoryCache {
       console.log(`[内存缓存] 清理 ${cleaned} 个过期项`);
     }
   }
+
+  // 获取缓存大小
+  size(): number {
+    return this.cache.size;
+  }
+
+  // 获取所有键
+  keys(): string[] {
+    return Array.from(this.cache.keys());
+  }
 }
 
-// 双层缓存服务
+// 三层缓存服务：内存 -> Redis -> 数据库
 class CacheServiceV2 {
   private memoryCache: MemoryCache;
   private cleanupInterval: NodeJS.Timeout | null = null;
@@ -75,18 +87,29 @@ class CacheServiceV2 {
   // ===========================================
 
   /**
-   * 获取基金基本信息（先查内存缓存，再查数据库）
+   * 获取基金基本信息（三层缓存：内存 -> Redis -> 数据库）
    */
   async getFundInfo(code: string): Promise<database.FundInfo | null> {
+    const cacheKey = `fund:info:${code}`;
+
     // 第一层：内存缓存
-    const memValue = this.memoryCache.get<database.FundInfo>(`fund:info:${code}`);
+    const memValue = this.memoryCache.get<database.FundInfo>(cacheKey);
     if (memValue) return memValue;
 
-    // 第二层：数据库
+    // 第二层：Redis 缓存
+    const redisValue = await redisCache.get<database.FundInfo>(cacheKey);
+    if (redisValue) {
+      // 回填内存缓存
+      this.memoryCache.set(cacheKey, redisValue, CACHE_TTL.FUND_INFO);
+      return redisValue;
+    }
+
+    // 第三层：数据库
     const dbValue = await database.getFundInfo(code);
     if (dbValue) {
-      // 写入内存缓存
-      this.memoryCache.set(`fund:info:${code}`, dbValue, CACHE_TTL.FUND_INFO);
+      // 回填各级缓存
+      await redisCache.set(cacheKey, dbValue, CACHE_TTL.FUND_INFO);
+      this.memoryCache.set(cacheKey, dbValue, CACHE_TTL.FUND_INFO);
     }
 
     return dbValue;
@@ -96,10 +119,14 @@ class CacheServiceV2 {
    * 保存基金基本信息
    */
   async setFundInfo(fund: database.FundInfo): Promise<void> {
+    const cacheKey = `fund:info:${fund.code}`;
+
     // 保存到数据库
     await database.upsertFundInfo(fund);
-    // 写入内存缓存
-    this.memoryCache.set(`fund:info:${fund.code}`, fund, CACHE_TTL.FUND_INFO);
+    
+    // 写入各级缓存
+    await redisCache.set(cacheKey, fund, CACHE_TTL.FUND_INFO);
+    this.memoryCache.set(cacheKey, fund, CACHE_TTL.FUND_INFO);
   }
 
   /**
@@ -108,10 +135,13 @@ class CacheServiceV2 {
   async batchSetFundInfo(funds: database.FundInfo[]): Promise<void> {
     // 保存到数据库
     await database.batchUpsertFundInfo(funds);
-    // 写入内存缓存
-    funds.forEach(fund => {
-      this.memoryCache.set(`fund:info:${fund.code}`, fund, CACHE_TTL.FUND_INFO);
-    });
+    
+    // 写入各级缓存
+    for (const fund of funds) {
+      const cacheKey = `fund:info:${fund.code}`;
+      await redisCache.set(cacheKey, fund, CACHE_TTL.FUND_INFO);
+      this.memoryCache.set(cacheKey, fund, CACHE_TTL.FUND_INFO);
+    }
   }
 
   // ===========================================
@@ -130,10 +160,17 @@ class CacheServiceV2 {
     const memValue = this.memoryCache.get<database.StockInfo[]>(cacheKey);
     if (memValue) return memValue;
 
-    // 第二层：数据库
+    // 第二层：Redis 缓存
+    const redisValue = await redisCache.get<database.StockInfo[]>(cacheKey);
+    if (redisValue) {
+      this.memoryCache.set(cacheKey, redisValue, CACHE_TTL.STOCKS);
+      return redisValue;
+    }
+
+    // 第三层：数据库
     const dbValue = await database.getStocks(fundCode, updateDate);
     if (dbValue && dbValue.length > 0) {
-      // 写入内存缓存
+      await redisCache.set(cacheKey, dbValue, CACHE_TTL.STOCKS);
       this.memoryCache.set(cacheKey, dbValue, CACHE_TTL.STOCKS);
     }
 
@@ -149,13 +186,16 @@ class CacheServiceV2 {
     const fundCode = stocks[0].fund_code;
     const updateDate = stocks[0].update_date;
     const cacheKey = `fund:stocks:${fundCode}:${updateDate}`;
+    const latestKey = `fund:stocks:latest:${fundCode}`;
 
     // 保存到数据库
     await database.upsertStocks(stocks);
-    // 写入内存缓存
+    
+    // 写入各级缓存
+    await redisCache.set(cacheKey, stocks, CACHE_TTL.STOCKS);
+    await redisCache.set(latestKey, stocks, CACHE_TTL.STOCKS);
     this.memoryCache.set(cacheKey, stocks, CACHE_TTL.STOCKS);
-    // 更新最新缓存
-    this.memoryCache.set(`fund:stocks:latest:${fundCode}`, stocks, CACHE_TTL.STOCKS);
+    this.memoryCache.set(latestKey, stocks, CACHE_TTL.STOCKS);
   }
 
   // ===========================================
@@ -172,10 +212,17 @@ class CacheServiceV2 {
     const memValue = this.memoryCache.get<database.HistoryData[]>(cacheKey);
     if (memValue) return memValue;
 
-    // 第二层：数据库
+    // 第二层：Redis 缓存
+    const redisValue = await redisCache.get<database.HistoryData[]>(cacheKey);
+    if (redisValue) {
+      this.memoryCache.set(cacheKey, redisValue, CACHE_TTL.HISTORY);
+      return redisValue;
+    }
+
+    // 第三层：数据库
     const dbValue = await database.getHistory(fundCode, days);
     if (dbValue && dbValue.length > 0) {
-      // 写入内存缓存
+      await redisCache.set(cacheKey, dbValue, CACHE_TTL.HISTORY);
       this.memoryCache.set(cacheKey, dbValue, CACHE_TTL.HISTORY);
     }
 
@@ -193,7 +240,9 @@ class CacheServiceV2 {
 
     // 保存到数据库
     await database.upsertHistory(history);
-    // 写入内存缓存
+    
+    // 写入各级缓存
+    await redisCache.set(cacheKey, history, CACHE_TTL.HISTORY);
     this.memoryCache.set(cacheKey, history, CACHE_TTL.HISTORY);
   }
 
@@ -202,52 +251,111 @@ class CacheServiceV2 {
   // ===========================================
 
   /**
-   * 获取通用缓存
+   * 获取通用缓存（三层缓存）
    */
-  get<T>(key: string): T | null {
-    return this.memoryCache.get<T>(key);
+  async get<T>(key: string): Promise<T | null> {
+    // 第一层：内存缓存
+    const memValue = this.memoryCache.get<T>(key);
+    if (memValue) return memValue;
+
+    // 第二层：Redis 缓存
+    const redisValue = await redisCache.get<T>(key);
+    if (redisValue) {
+      const defaultTtl = CACHE_TTL.ESTIMATE;
+      this.memoryCache.set(key, redisValue, defaultTtl);
+      return redisValue;
+    }
+
+    return null;
   }
 
   /**
    * 设置通用缓存
    */
-  set<T>(key: string, value: T, ttl?: number): void {
+  async set<T>(key: string, value: T, ttl?: number): Promise<void> {
     const defaultTtl = CACHE_TTL.ESTIMATE;
-    this.memoryCache.set(key, value, ttl || defaultTtl);
+    const actualTtl = ttl || defaultTtl;
+    
+    // 写入 Redis
+    await redisCache.set(key, value, actualTtl);
+    
+    // 写入内存缓存
+    this.memoryCache.set(key, value, actualTtl);
   }
 
   /**
    * 删除缓存
    */
-  delete(key: string): void {
+  async delete(key: string): Promise<void> {
+    await redisCache.delete(key);
     this.memoryCache.delete(key);
   }
 
   /**
    * 清空所有缓存
    */
-  clear(): void {
+  async clear(): Promise<void> {
+    await redisCache.flushAll();
     this.memoryCache.clear();
   }
 
   /**
    * 删除基金相关缓存
    */
-  clearFundCache(fundCode: string): void {
-    this.memoryCache.delete(`fund:info:${fundCode}`);
-    this.memoryCache.delete(`fund:stocks:latest:${fundCode}`);
-    this.memoryCache.delete(`fund:history:${fundCode}:365`);
+  async clearFundCache(fundCode: string): Promise<void> {
+    const patterns = [
+      `fund:info:${fundCode}`,
+      `fund:stocks:*:${fundCode}`,
+      `fund:history:${fundCode}:*`,
+    ];
+
+    for (const pattern of patterns) {
+      await redisCache.deletePattern(pattern);
+    }
+
+    // 清理内存缓存
+    const keys = this.memoryCache.keys();
+    for (const key of keys) {
+      if (key.includes(fundCode)) {
+        this.memoryCache.delete(key);
+      }
+    }
+
     console.log(`[缓存] 清理基金 ${fundCode} 的缓存`);
   }
 
   /**
    * 获取缓存统计信息
    */
-  getStats(): { size: number; keys: string[] } {
-    const cache = (this.memoryCache as any).cache;
+  async getStats(): Promise<{
+    memory: { size: number; keys: string[] };
+    redis: { available: boolean; dbsize?: number } | null;
+  }> {
+    const redisStats = await redisCache.getStats();
+    
     return {
-      size: cache.size,
-      keys: Array.from(cache.keys()),
+      memory: {
+        size: this.memoryCache.size(),
+        keys: this.memoryCache.keys(),
+      },
+      redis: redisStats ? {
+        available: true,
+        dbsize: redisStats.dbsize,
+      } : {
+        available: false,
+      },
+    };
+  }
+
+  /**
+   * 检查 Redis 健康状态
+   */
+  async healthCheck(): Promise<{ memory: boolean; redis: boolean }> {
+    const redisHealthy = await redisCache.healthCheck();
+    
+    return {
+      memory: true, // 内存缓存总是健康的
+      redis: redisHealthy,
     };
   }
 

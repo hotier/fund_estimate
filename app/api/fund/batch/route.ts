@@ -1,7 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 // 模拟基金数据
-const mockFundData = {
+interface FundData {
+  code: string;
+  name: string;
+  estimate_value: string;
+  actual_value: string;
+  change_percent: number;
+  update_time: string;
+  data_source: string;
+}
+
+const mockFundData: Record<string, FundData> = {
   '000001': {
     code: '000001',
     name: '华夏成长混合',

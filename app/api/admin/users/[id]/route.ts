@@ -20,6 +20,9 @@ export async function PUT(
     const token = authHeader?.replace('Bearer ', '');
 
     // 验证管理员权限
+    if (!token) {
+      throw new Error('未提供认证令牌');
+    }
     const { userId: adminId } = await validateUserAccess(token, true);
     const targetUserId = params.id;
 
@@ -70,6 +73,9 @@ export async function DELETE(
     const token = authHeader?.replace('Bearer ', '');
 
     // 验证管理员权限
+    if (!token) {
+      throw new Error('未提供认证令牌');
+    }
     const { userId: adminId } = await validateUserAccess(token, true);
     const targetUserId = params.id;
 
@@ -88,7 +94,7 @@ export async function DELETE(
       }
     ).then(res => res.json());
 
-    const targetUser = (data as any).data?.find((u: any) => u.id === targetUserId);
+    const targetUser = (user as any).data?.find((u: any) => u.id === targetUserId);
     if (!targetUser) {
       throw new Error('用户不存在');
     }

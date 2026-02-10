@@ -5,39 +5,21 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import cacheService from './cacheServiceV2';
 import * as database from '../supabase/database';
+import { FundStock, FundEstimate } from '../services/dataFetcher';
 
-// 基金基本信息接口
-export interface FundInfo {
+// 基金基本信息接口（来自新浪）
+interface SinaFundInfo {
   code: string;
   name: string;
   type: string;
   manager: string;
 }
 
-// 基金重仓股接口
-export interface FundStock {
-  code: string;
-  name: string;
-  proportion: number; // 占比
-  price: number; // 当前价格
-  change: number; // 涨跌幅
-}
 
-// 基金估值接口
-export interface FundEstimate {
-  code: string;
-  name: string;
-  estimate_value: number; // 估算净值
-  actual_value: number; // 实际净值（前一日）
-  change_percent: number; // 估算涨跌幅
-  update_time: string;
-  data_source: string;
-  stocks?: FundStock[]; // 重仓股数据
-}
 
 class DataFetcherV2 {
   // 从新浪财经API获取基金基本信息
-  async getFundInfoFromSina(code: string): Promise<FundInfo | null> {
+  async getFundInfoFromSina(code: string): Promise<SinaFundInfo | null> {
     try {
       console.log(`[Sina] 获取基金 ${code} 的基本信息...`);
 
@@ -62,13 +44,34 @@ class DataFetcherV2 {
         return null;
       }
 
-      const wb_default = fundData.wb_default || '';
+      // 尝试多种方式提取基金名称
       let name = '';
+
+      // 方式1: 从 wb_default 字段提取
+      const wb_default = fundData.wb_default || '';
       if (wb_default) {
         name = wb_default.split(' of')[0].replace('$', '').trim();
       }
+
+      // 方式2: 从 name 字段提取
+      if (!name && fundData.name) {
+        name = fundData.name.trim();
+      }
+
+      // 方式3: 从 title 字段提取
+      if (!name && fundData.title) {
+        name = fundData.title.trim();
+      }
+
+      // 方式4: 从 fundname 字段提取
+      if (!name && fundData.fundname) {
+        name = fundData.fundname.trim();
+      }
+
+      // 如果还是没有找到名称，记录完整的响应数据以便调试
       if (!name) {
         console.error(`[Sina] 未找到基金 ${code} 的名称`);
+        console.error(`[Sina] 响应数据:`, JSON.stringify(fundData, null, 2));
         return null;
       }
 
@@ -172,40 +175,17 @@ class DataFetcherV2 {
     }
   }
 
-  // 获取基金基本信息（先查缓存，再查API）
-  async getFundInfo(code: string): Promise<FundInfo | null> {
-    // 先查缓存
-    const cached = await cacheService.getFundInfo(code);
-    if (cached) {
-      console.log(`[缓存] 命中基金 ${code} 的基本信息`);
-      return {
-        code: cached.code,
-        name: cached.name,
-        type: cached.type || '未知',
-        manager: cached.manager || '未知',
-      };
-    }
-
-    // 缓存未命中，从API获取
+  // 获取基金基本信息（强制从新浪 API 获取实时数据，不使用缓存）
+  async getFundInfo(code: string): Promise<database.FundInfo | null> {
+    console.log(`[实时数据] 从新浪 API 获取基金 ${code} 的基本信息...`);
+    // 强制从API获取，不使用任何缓存
     return await this.getFundInfoFromSina(code);
   }
 
-  // 获取基金重仓股（先查缓存，再查API）
+  // 获取基金重仓股（强制从新浪 API 获取实时数据，不使用缓存）
   async getFundStocks(code: string): Promise<FundStock[]> {
-    // 先查缓存
-    const cached = await cacheService.getStocks(code);
-    if (cached && cached.length > 0) {
-      console.log(`[缓存] 命中基金 ${code} 的重仓股数据`);
-      return cached.map(s => ({
-        code: s.stock_code,
-        name: s.stock_name,
-        proportion: s.proportion,
-        price: 0,
-        change: s.change_percent || 0,
-      }));
-    }
-
-    // 缓存未命中，从API获取
+    console.log(`[实时数据] 从新浪 API 获取基金 ${code} 的重仓股数据...`);
+    // 强制从API获取，不使用任何缓存
     return await this.getFundStocksFromSina(code);
   }
 
@@ -347,4 +327,3 @@ class DataFetcherV2 {
 const dataFetcherV2 = new DataFetcherV2();
 
 export default dataFetcherV2;
-export type { FundInfo, FundStock, FundEstimate };

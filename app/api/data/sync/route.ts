@@ -98,7 +98,7 @@ export async function POST(request: NextRequest) {
  */
 export async function GET() {
   try {
-    const stats = cacheService.getStats();
+    const stats = await cacheService.getStats();
     const fundCount = await database.getFundCount();
     const recentlyUpdated = await database.getRecentlyUpdatedFunds(5);
 
@@ -106,8 +106,8 @@ export async function GET() {
       success: true,
       data: {
         cache: {
-          size: stats.size,
-          keys: stats.keys,
+          size: stats.memory.size,
+          keys: stats.memory.keys,
         },
         database: {
           fundCount,
